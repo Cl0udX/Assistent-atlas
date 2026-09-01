@@ -10,13 +10,14 @@ const SESSION_DIR = process.env.ATLAS_WHATSAPP_SESSION_DIR || "./session";
 const BLACKLIST_PATH = process.env.ATLAS_WHATSAPP_BLACKLIST_PATH || "./blacklist.csv";
 const CALL_BLACKLIST_PATH = process.env.ATLAS_WHATSAPP_CALL_BLACKLIST_PATH || "./call_blacklist.csv";
 const BLACKLIST_MIN_MATCH_LEN = 7; // igual que en app/tools/whatsapp_blacklist.py
+const LEARNED_NAMES_PATH = process.env.ATLAS_WHATSAPP_LEARNED_NAMES_PATH || "./learned_names.json";
 // Cuantas llamadas sin responder de un contacto se dejan sonar normal antes
 // de que el bot empiece a rechazarlas automaticamente.
 const CALL_REJECT_THRESHOLD = Number(process.env.ATLAS_CALL_REJECT_THRESHOLD || 2);
 // Cuanto esperar antes de mandar la auto-respuesta, para darle tiempo a
 // Santiago de contestar el mismo primero. Si Santiago escribe en esa
 // ventana, se cancela el auto-reply pendiente para ese contacto.
-const REPLY_DELAY_MS = Number(process.env.ATLAS_SECRETARY_REPLY_DELAY_MS || 150000); // 2.5 min
+const REPLY_DELAY_MS = Number(process.env.ATLAS_SECRETARY_REPLY_DELAY_MS || 0); // 2.5 min 150000
 const REPLY_PREFIX = "🤖 *AtlasAssistant*\n";
 // Baileys NO puede "contestar" una llamada con audio real (no implementa el
 // protocolo de medios de WhatsApp) — lo unico posible es rechazarla y avisar.
@@ -25,7 +26,7 @@ const REPLY_PREFIX = "🤖 *AtlasAssistant*\n";
 // esta activo en la conversacion y el bot NO auto-responde, sin importar
 // REPLY_DELAY_MS (con delay 0 no hay ventana real para "cancelar", esto es
 // independiente de eso).
-const ACTIVE_WINDOW_MS = Number(process.env.ATLAS_SECRETARY_ACTIVE_WINDOW_MS || 600000); // 10 min
+const ACTIVE_WINDOW_MS = Number(process.env.ATLAS_SECRETARY_ACTIVE_WINDOW_MS || 0); // 10 min 600000
 
 // jid -> { timer, reply }. Un solo pendiente por contacto: si llegan varios
 // mensajes seguidos, se reinicia el timer y solo se manda la respuesta al
@@ -33,11 +34,40 @@ const ACTIVE_WINDOW_MS = Number(process.env.ATLAS_SECRETARY_ACTIVE_WINDOW_MS || 
 const pending = new Map();
 // jid -> timestamp (ms) del ultimo mensaje que Santiago mando el mismo.
 const lastFromMeAt = new Map();
-// id (lid o numero, sin @...) -> nombre guardado/notify. WhatsApp ahora usa
-// IDs anonimos (@lid) para muchos contactos en vez del numero real — esto
-// deja identificar por nombre igual (clave para llamadas, que no traen
-// pushName). Se llena solo, en vivo, con los eventos de contactos de Baileys.
+// id (lid o numero, sin @...) -> nombre. WhatsApp ahora usa IDs anonimos
+// (@lid) para muchos contactos en vez del numero real, y ademas la sync
+// completa de contactos de Baileys nunca llega en una sesion ya vinculada
+// (confirmado: 0 eventos 'messaging-history.set' en meses de logs). Este
+// mapa se llena APRENDIENDO el pushName la primera vez que alguien escribe
+// o manda un audio (eso si siempre trae nombre) — asi, cuando esa misma
+// persona LLAMA despues (las llamadas no traen pushName), ya la reconocemos.
+// Se persiste en disco para sobrevivir reinicios del servicio.
 const contactNames = new Map();
+
+function loadLearnedNames() {
+  try {
+    const raw = fs.readFileSync(LEARNED_NAMES_PATH, "utf8");
+    const obj = JSON.parse(raw);
+    for (const [id, name] of Object.entries(obj)) contactNames.set(id, name);
+    console.log(`Cargados ${Object.keys(obj).length} nombres aprendidos de contactos.`);
+  } catch {
+    // no existe todavia, arranca vacio
+  }
+}
+
+function learnContactName(jid, name) {
+  if (!name) return;
+  const idPart = jid.split("@")[0].split(":")[0];
+  if (contactNames.get(idPart) === name) return; // sin cambios, no reescribir
+  contactNames.set(idPart, name);
+  try {
+    fs.writeFileSync(LEARNED_NAMES_PATH, JSON.stringify(Object.fromEntries(contactNames), null, 2));
+  } catch (err) {
+    console.error("fallo guardando nombres aprendidos:", err.message);
+  }
+}
+
+loadLearnedNames();
 // jid -> cantidad de llamadas sin responder consecutivas. Se resetea por
 // completo (para todos los contactos) apenas Santiago tiene actividad.
 const missedCallCount = new Map();
@@ -194,13 +224,17 @@ async function start() {
     auth: state,
     logger,
     printQRInTerminal: false,
+    syncFullHistory: true,
   });
 
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("contacts.upsert", (contacts) => contacts.forEach(rememberContact));
   sock.ev.on("contacts.update", (contacts) => contacts.forEach(rememberContact));
-  sock.ev.on("messaging-history.set", ({ contacts }) => (contacts || []).forEach(rememberContact));
+  sock.ev.on("messaging-history.set", ({ contacts }) => {
+    console.log(`messaging-history.set: ${(contacts || []).length} contactos recibidos.`);
+    (contacts || []).forEach(rememberContact);
+  });
 
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -263,6 +297,7 @@ async function start() {
         continue;
       }
 
+      learnContactName(jid, msg.pushName);
       const sender = displayNameFor(jid, msg.pushName);
       let atlasPayload;
 

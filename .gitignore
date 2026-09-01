@@ -17,9 +17,11 @@ __pycache__/
 *.sqlite
 *.sqlite3
 
-# Datos privados en runtime (numeros de telefono reales)
+# Datos privados en runtime (numeros de telefono y nombres reales)
 blacklist.csv
 call_blacklist.csv
+contacts.csv
+learned_names.json
 
 # Logs y basura de sistema operativo
 *.log
