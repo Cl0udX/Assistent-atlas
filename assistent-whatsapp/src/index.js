@@ -5,6 +5,7 @@ import pino from "pino";
 import qrcode from "qrcode-terminal";
 
 const ATLAS_URL = process.env.ATLAS_WHATSAPP_URL || "http://127.0.0.1:8000/whatsapp-inbound";
+const ATLAS_OUTCOME_URL = process.env.ATLAS_WHATSAPP_OUTCOME_URL || "http://127.0.0.1:8000/whatsapp-outcome";
 const SHARED_SECRET = process.env.ATLAS_WHATSAPP_SECRET || "";
 const SESSION_DIR = process.env.ATLAS_WHATSAPP_SESSION_DIR || "./session";
 const BLACKLIST_PATH = process.env.ATLAS_WHATSAPP_BLACKLIST_PATH || "./blacklist.csv";
@@ -140,6 +141,26 @@ async function forwardToAtlas(payload) {
   } catch (err) {
     console.error("fallo reenviando a Atlas:", err.message);
     return null;
+  }
+}
+
+// Le avisa a Atlas el resultado REAL de una respuesta en cola (se mando o se
+// cancelo), para que el aviso de Telegram nunca diga "le respondi" antes de
+// que eso sea cierto (una respuesta en cola se puede cancelar si Santiago
+// contesta el mismo antes de que se cumpla la espera).
+async function reportOutcome(jid, sender_name, sent) {
+  try {
+    await fetch(ATLAS_OUTCOME_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Atlas-Secret": SHARED_SECRET,
+      },
+      body: JSON.stringify({ jid, sender_name, sent }),
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch (err) {
+    console.error("fallo avisando el resultado a Atlas:", err.message);
   }
 }
 
@@ -309,6 +330,7 @@ async function start() {
           clearTimeout(p.timer);
           pending.delete(jid);
           console.log(`Santiago respondio ${jid} manualmente, cancelo auto-respuesta pendiente.`);
+          reportOutcome(jid, p.sender_name, false);
         }
         continue;
       }
@@ -375,12 +397,13 @@ async function start() {
           } else {
             markOwnMessage(await sock.sendMessage(jid, { text: REPLY_PREFIX + result.reply }));
           }
+          reportOutcome(jid, sender, true);
         } catch (err) {
           console.error("fallo enviando auto-respuesta:", err.message);
         }
       }, REPLY_DELAY_MS);
 
-      pending.set(jid, { timer, reply: result.reply });
+      pending.set(jid, { timer, reply: result.reply, sender_name: sender });
     }
   });
 
