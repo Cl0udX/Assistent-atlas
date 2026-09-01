@@ -17,7 +17,7 @@ const CALL_REJECT_THRESHOLD = Number(process.env.ATLAS_CALL_REJECT_THRESHOLD || 
 // Cuanto esperar antes de mandar la auto-respuesta, para darle tiempo a
 // Santiago de contestar el mismo primero. Si Santiago escribe en esa
 // ventana, se cancela el auto-reply pendiente para ese contacto.
-const REPLY_DELAY_MS = Number(process.env.ATLAS_SECRETARY_REPLY_DELAY_MS || 0); // 2.5 min 150000
+const REPLY_DELAY_MS = Number(process.env.ATLAS_SECRETARY_REPLY_DELAY_MS || 150000); // 2.5 min
 const REPLY_PREFIX = "🤖 *AtlasAssistant*\n";
 // Baileys NO puede "contestar" una llamada con audio real (no implementa el
 // protocolo de medios de WhatsApp) — lo unico posible es rechazarla y avisar.
@@ -26,7 +26,7 @@ const REPLY_PREFIX = "🤖 *AtlasAssistant*\n";
 // esta activo en la conversacion y el bot NO auto-responde, sin importar
 // REPLY_DELAY_MS (con delay 0 no hay ventana real para "cancelar", esto es
 // independiente de eso).
-const ACTIVE_WINDOW_MS = Number(process.env.ATLAS_SECRETARY_ACTIVE_WINDOW_MS || 0); // 10 min 600000
+const ACTIVE_WINDOW_MS = Number(process.env.ATLAS_SECRETARY_ACTIVE_WINDOW_MS || 600000); // 10 min
 
 // jid -> { timer, reply }. Un solo pendiente por contacto: si llegan varios
 // mensajes seguidos, se reinicia el timer y solo se manda la respuesta al
@@ -68,6 +68,35 @@ function learnContactName(jid, name) {
 }
 
 loadLearnedNames();
+
+// Avisos de llamada rechazada: texto/audio FIJO (pre-generado una sola vez
+// con `python -c "from app.tts import synthesize_speech..."`, ver
+// call_reject_audio/). Una llamada rechazada no tiene contenido real para
+// que un LLM le responda de forma distinta cada vez, asi que no vale la
+// pena el costo/latencia de generarlo dinamicamente — variedad minima via
+// varias variantes fijas elegidas al azar, sin gastar nada por llamada.
+const CALL_REJECT_TEXTS = [
+  "Santiago no puede atender llamadas en este momento. Si es algo importante, escribime por acá y le aviso enseguida.",
+  "Ahora mismo Santiago no puede contestar el teléfono. Contame qué necesitás y se lo hago llegar.",
+  "Santiago está ocupado y no puede atender llamadas ahora. Si querés, escribime y le paso el mensaje.",
+  "En este momento no puedo pasarte con Santiago por teléfono. Escribime acá y le aviso que necesitás hablar con él.",
+];
+const CALL_REJECT_AUDIO_DIR = process.env.ATLAS_CALL_REJECT_AUDIO_DIR || "./call_reject_audio";
+const callRejectVariants = CALL_REJECT_TEXTS.map((text, i) => {
+  const path = `${CALL_REJECT_AUDIO_DIR}/variant_${i + 1}.ogg`;
+  let audio = null;
+  try {
+    audio = fs.readFileSync(path);
+  } catch {
+    console.error(`no se encontro ${path}, esa variante caera a texto plano.`);
+  }
+  return { text, audio };
+});
+
+function pickCallRejectVariant() {
+  return callRejectVariants[Math.floor(Math.random() * callRejectVariants.length)];
+}
+
 // jid -> cantidad de llamadas sin responder consecutivas. Se resetea por
 // completo (para todos los contactos) apenas Santiago tiene actividad.
 const missedCallCount = new Map();
@@ -260,7 +289,7 @@ async function start() {
     if (type !== "notify") return;
     for (const msg of messages) {
       const jid = msg.key.remoteJid;
-      if (!jid || jid.endsWith("@g.us") || jid === "status@broadcast") continue; // ignorar grupos y estados
+      if (!jid || jid.endsWith("@g.us") || jid.endsWith("@newsletter") || jid === "status@broadcast") continue; // ignorar grupos, canales/newsletters y estados
 
       if (msg.key.fromMe) {
         if (ownSentMessageIds.has(msg.key.id)) {
@@ -404,8 +433,7 @@ async function start() {
       }
 
       // Ya fallaron 3+ intentos sin que Santiago tuviera actividad: rechazar
-      // automatico y avisar con un mensaje generado por Atlas (acorde al
-      // contexto de la conversacion con este contacto, si existe).
+      // automatico y avisar con un texto/audio fijo (ver CALL_REJECT_TEXTS).
       console.log(`Llamada entrante de ${name || jid} (umbral superado, rechazo automatico).`);
       try {
         await sock.rejectCall(call.id, call.from);
@@ -413,18 +441,22 @@ async function start() {
         console.error("fallo rechazando llamada:", err.message);
       }
 
-      const result = await forwardToAtlas({ type: "call", jid, sender_name: name || jid });
+      // Se manda igual a Atlas para que quede registrada, se notifique por
+      // Telegram y (cada 5 intentos) por Pushover — pero ya no se usa su
+      // respuesta, el aviso al que llama es siempre el texto/audio fijo.
+      forwardToAtlas({ type: "call", jid, sender_name: name || jid }).catch(() => {});
 
       try {
-        if (result?.audio_b64) {
+        const variant = pickCallRejectVariant();
+        if (variant.audio) {
           markOwnMessage(await sock.sendMessage(jid, { text: REPLY_PREFIX.trim() }));
           markOwnMessage(await sock.sendMessage(jid, {
-            audio: Buffer.from(result.audio_b64, "base64"),
+            audio: variant.audio,
             mimetype: "audio/ogg; codecs=opus",
             ptt: true,
           }));
-        } else if (result?.reply) {
-          markOwnMessage(await sock.sendMessage(jid, { text: REPLY_PREFIX + result.reply }));
+        } else {
+          markOwnMessage(await sock.sendMessage(jid, { text: REPLY_PREFIX + variant.text }));
         }
       } catch (err) {
         console.error("fallo avisando tras la llamada:", err.message);
