@@ -19,7 +19,9 @@ __pycache__/
 
 # Datos privados en runtime (numeros de telefono reales)
 blacklist.csv
+call_blacklist.csv
 
 # Logs y basura de sistema operativo
 *.log
 .DS_Store
+imperial-audio-468104-u9-4d189e215434.json

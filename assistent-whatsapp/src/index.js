@@ -8,12 +8,19 @@ const ATLAS_URL = process.env.ATLAS_WHATSAPP_URL || "http://127.0.0.1:8000/whats
 const SHARED_SECRET = process.env.ATLAS_WHATSAPP_SECRET || "";
 const SESSION_DIR = process.env.ATLAS_WHATSAPP_SESSION_DIR || "./session";
 const BLACKLIST_PATH = process.env.ATLAS_WHATSAPP_BLACKLIST_PATH || "./blacklist.csv";
+const CALL_BLACKLIST_PATH = process.env.ATLAS_WHATSAPP_CALL_BLACKLIST_PATH || "./call_blacklist.csv";
 const BLACKLIST_MIN_MATCH_LEN = 7; // igual que en app/tools/whatsapp_blacklist.py
+// Cuantas llamadas sin responder de un contacto se dejan sonar normal antes
+// de que el bot empiece a rechazarlas automaticamente.
+const CALL_REJECT_THRESHOLD = Number(process.env.ATLAS_CALL_REJECT_THRESHOLD || 2);
 // Cuanto esperar antes de mandar la auto-respuesta, para darle tiempo a
 // Santiago de contestar el mismo primero. Si Santiago escribe en esa
 // ventana, se cancela el auto-reply pendiente para ese contacto.
 const REPLY_DELAY_MS = Number(process.env.ATLAS_SECRETARY_REPLY_DELAY_MS || 150000); // 2.5 min
 const REPLY_PREFIX = "🤖 *AtlasAssistant*\n";
+// Baileys NO puede "contestar" una llamada con audio real (no implementa el
+// protocolo de medios de WhatsApp) — lo unico posible es rechazarla y avisar.
+// El mensaje/audio de aviso lo genera Atlas (LLM), no es texto fijo aca.
 // Si Santiago le escribio a este contacto hace menos de esto, se asume que
 // esta activo en la conversacion y el bot NO auto-responde, sin importar
 // REPLY_DELAY_MS (con delay 0 no hay ventana real para "cancelar", esto es
@@ -26,6 +33,27 @@ const ACTIVE_WINDOW_MS = Number(process.env.ATLAS_SECRETARY_ACTIVE_WINDOW_MS || 
 const pending = new Map();
 // jid -> timestamp (ms) del ultimo mensaje que Santiago mando el mismo.
 const lastFromMeAt = new Map();
+// id (lid o numero, sin @...) -> nombre guardado/notify. WhatsApp ahora usa
+// IDs anonimos (@lid) para muchos contactos en vez del numero real — esto
+// deja identificar por nombre igual (clave para llamadas, que no traen
+// pushName). Se llena solo, en vivo, con los eventos de contactos de Baileys.
+const contactNames = new Map();
+// jid -> cantidad de llamadas sin responder consecutivas. Se resetea por
+// completo (para todos los contactos) apenas Santiago tiene actividad.
+const missedCallCount = new Map();
+// IDs de mensajes que mando el propio bot: como Baileys esta vinculado a la
+// cuenta real de Santiago, todo lo que el bot envia llega de vuelta como un
+// evento fromMe=true identico a si Santiago lo hubiera escrito el mismo. Sin
+// esto, cada auto-respuesta se auto-detectaba como "actividad de Santiago" y
+// reseteaba el rechazo automatico de llamadas apenas se activaba.
+const ownSentMessageIds = new Set();
+
+function markOwnMessage(sent) {
+  const id = sent?.key?.id;
+  if (!id) return;
+  ownSentMessageIds.add(id);
+  setTimeout(() => ownSentMessageIds.delete(id), 60000);
+}
 
 if (!SHARED_SECRET) {
   console.error("ATLAS_WHATSAPP_SECRET no esta configurado. Abortando.");
@@ -69,20 +97,85 @@ function numbersMatch(a, b) {
   return longer.endsWith(shorter);
 }
 
-function isBlacklisted(jid) {
-  let content;
-  try {
-    content = fs.readFileSync(BLACKLIST_PATH, "utf8");
-  } catch {
-    return false; // no existe el archivo todavia = lista vacia
-  }
-  const number = jid.split("@")[0];
-  return content
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .some((line) => numbersMatch(number, line));
+function rememberContact(c) {
+  if (!c) return;
+  const name = c.name || c.notify || null;
+  if (!name) return;
+  const lidId = c.lid ? String(c.lid).split("@")[0].split(":")[0] : null;
+  const jidId = (c.jid || c.id) ? String(c.jid || c.id).split("@")[0].split(":")[0] : null;
+  if (lidId) contactNames.set(lidId, name);
+  if (jidId) contactNames.set(jidId, name);
 }
+
+function displayNameFor(jid, fallback) {
+  const key = jid.split("@")[0].split(":")[0];
+  return contactNames.get(key) || fallback || jid;
+}
+
+// WhatsApp ahora usa @lid (id anonimo) para muchos contactos en vez del
+// numero real en el jid, asi que comparar por numero solo no alcanza:
+// resolvemos activamente los numeros de cada blacklist a su LID actual.
+// makeBlacklist() crea una lista independiente (con su propio cache) para
+// un archivo CSV dado, asi mensajes y llamadas quedan totalmente separados.
+function makeBlacklist(path) {
+  let lidSet = new Set();
+  let rawContent = null;
+
+  async function refreshLids(sock) {
+    let content;
+    try {
+      content = fs.readFileSync(path, "utf8");
+    } catch {
+      lidSet = new Set();
+      rawContent = null;
+      return;
+    }
+    if (content === rawContent) return; // sin cambios, no re-resolver
+    rawContent = content;
+
+    const numbers = content.split("\n").map((l) => l.trim()).filter(Boolean);
+    const resolved = new Set();
+    for (const num of numbers) {
+      const digits = digitsOnly(num);
+      if (digits.length < BLACKLIST_MIN_MATCH_LEN) continue;
+      try {
+        const results = await sock.onWhatsApp(digits);
+        for (const r of results || []) {
+          if (r?.lid) resolved.add(String(r.lid).split("@")[0].split(":")[0]);
+        }
+      } catch (err) {
+        console.error(`no se pudo resolver LID para ${num} (${path}):`, err.message);
+      }
+    }
+    lidSet = resolved;
+  }
+
+  async function isBlocked(sock, jid) {
+    await refreshLids(sock);
+
+    const idPart = jid.split("@")[0].split(":")[0];
+    if (jid.endsWith("@lid")) {
+      return lidSet.has(idPart);
+    }
+
+    let content;
+    try {
+      content = fs.readFileSync(path, "utf8");
+    } catch {
+      return false; // no existe el archivo todavia = lista vacia
+    }
+    return content
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .some((line) => numbersMatch(idPart, line));
+  }
+
+  return { isBlocked };
+}
+
+const messageBlacklist = makeBlacklist(BLACKLIST_PATH);
+const callBlacklist = makeBlacklist(CALL_BLACKLIST_PATH);
 
 function classifyMessage(message) {
   if (!message) return null;
@@ -104,6 +197,10 @@ async function start() {
   });
 
   sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("contacts.upsert", (contacts) => contacts.forEach(rememberContact));
+  sock.ev.on("contacts.update", (contacts) => contacts.forEach(rememberContact));
+  sock.ev.on("messaging-history.set", ({ contacts }) => (contacts || []).forEach(rememberContact));
 
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -132,10 +229,18 @@ async function start() {
       if (!jid || jid.endsWith("@g.us") || jid === "status@broadcast") continue; // ignorar grupos y estados
 
       if (msg.key.fromMe) {
+        if (ownSentMessageIds.has(msg.key.id)) {
+          continue; // eco de un mensaje que mando el propio bot, no es actividad real
+        }
         // Santiago respondio el mismo desde su telefono: cancelar cualquier
-        // auto-respuesta pendiente para este contacto y recordar que esta
-        // activo aca, para no auto-responder tampoco a sus proximos mensajes.
+        // auto-respuesta pendiente para este contacto, recordar que esta
+        // activo aca, y contar como actividad global (resetea el rechazo
+        // automatico de llamadas para todos los contactos).
         lastFromMeAt.set(jid, Date.now());
+        if (missedCallCount.size > 0) {
+          missedCallCount.clear();
+          console.log("Actividad de Santiago detectada, reseteo el contador de llamadas sin responder.");
+        }
         const p = pending.get(jid);
         if (p) {
           clearTimeout(p.timer);
@@ -145,8 +250,8 @@ async function start() {
         continue;
       }
 
-      if (isBlacklisted(jid)) {
-        continue; // numero en lista negra: se ignora por completo, ni se registra ni se avisa
+      if (await messageBlacklist.isBlocked(sock, jid)) {
+        continue; // numero en lista negra de mensajes: se ignora por completo, ni se registra ni se avisa
       }
 
       const classified = classifyMessage(msg.message);
@@ -158,7 +263,7 @@ async function start() {
         continue;
       }
 
-      const sender = msg.pushName || jid;
+      const sender = displayNameFor(jid, msg.pushName);
       let atlasPayload;
 
       if (classified.kind === "text") {
@@ -194,7 +299,18 @@ async function start() {
       const timer = setTimeout(async () => {
         pending.delete(jid);
         try {
-          await sock.sendMessage(jid, { text: REPLY_PREFIX + result.reply });
+          if (result.audio_b64) {
+            // Aviso corto de que es el asistente, seguido de la nota de voz
+            // real (WhatsApp no permite "caption" en notas de voz).
+            markOwnMessage(await sock.sendMessage(jid, { text: REPLY_PREFIX.trim() }));
+            markOwnMessage(await sock.sendMessage(jid, {
+              audio: Buffer.from(result.audio_b64, "base64"),
+              mimetype: "audio/ogg; codecs=opus",
+              ptt: true,
+            }));
+          } else {
+            markOwnMessage(await sock.sendMessage(jid, { text: REPLY_PREFIX + result.reply }));
+          }
         } catch (err) {
           console.error("fallo enviando auto-respuesta:", err.message);
         }
@@ -206,10 +322,78 @@ async function start() {
 
   sock.ev.on("call", async (calls) => {
     for (const call of calls) {
-      if (call.status !== "offer") continue;
       const jid = call.from;
-      console.log(`Llamada entrante de ${jid}`);
-      await forwardToAtlas({ type: "call", jid, sender_name: jid });
+
+      if (call.status === "accept") {
+        // Santiago (o algun otro de sus dispositivos) contesto de verdad:
+        // eso es actividad real, resetea el rechazo automatico para todos.
+        if (missedCallCount.size > 0) {
+          missedCallCount.clear();
+          console.log("Llamada contestada manualmente, reseteo el contador de llamadas sin responder.");
+        }
+        continue;
+      }
+
+      if (call.status === "offer" || call.status === "ringing") {
+        if (call.status === "ringing") continue; // solo informativo
+      } else {
+        // Cualquier otro estado final (reject, terminate, timeout, o el que
+        // sea que use WhatsApp cuando cuelgan rapido) significa que la
+        // llamada termino sin ser contestada: cuenta como intento perdido.
+        // No listamos los strings exactos a proposito, para no depender de
+        // adivinar cual usa WhatsApp en cada caso.
+        const misses = (missedCallCount.get(jid) || 0) + 1;
+        missedCallCount.set(jid, misses);
+        console.log(`Llamada de ${displayNameFor(jid, null) || jid} termino sin responder (${misses}/${CALL_REJECT_THRESHOLD}), status=${call.status}.`);
+        continue;
+      }
+
+      if (await callBlacklist.isBlocked(sock, jid)) {
+        console.log(`Llamada de numero en lista negra de llamadas (${jid}), se rechaza siempre.`);
+        try {
+          await sock.rejectCall(call.id, call.from);
+        } catch (err) {
+          console.error("fallo rechazando llamada de lista negra:", err.message);
+        }
+        continue;
+      }
+
+      const misses = missedCallCount.get(jid) || 0;
+      const name = displayNameFor(jid, null);
+
+      if (misses < CALL_REJECT_THRESHOLD) {
+        // Todavia no supero el umbral: se deja sonar normal, para que
+        // Santiago tenga la oportunidad real de contestar el mismo.
+        console.log(`Llamada entrante de ${name || jid} (intento ${misses + 1}/${CALL_REJECT_THRESHOLD}, dejo sonar).`);
+        continue;
+      }
+
+      // Ya fallaron 3+ intentos sin que Santiago tuviera actividad: rechazar
+      // automatico y avisar con un mensaje generado por Atlas (acorde al
+      // contexto de la conversacion con este contacto, si existe).
+      console.log(`Llamada entrante de ${name || jid} (umbral superado, rechazo automatico).`);
+      try {
+        await sock.rejectCall(call.id, call.from);
+      } catch (err) {
+        console.error("fallo rechazando llamada:", err.message);
+      }
+
+      const result = await forwardToAtlas({ type: "call", jid, sender_name: name || jid });
+
+      try {
+        if (result?.audio_b64) {
+          markOwnMessage(await sock.sendMessage(jid, { text: REPLY_PREFIX.trim() }));
+          markOwnMessage(await sock.sendMessage(jid, {
+            audio: Buffer.from(result.audio_b64, "base64"),
+            mimetype: "audio/ogg; codecs=opus",
+            ptt: true,
+          }));
+        } else if (result?.reply) {
+          markOwnMessage(await sock.sendMessage(jid, { text: REPLY_PREFIX + result.reply }));
+        }
+      } catch (err) {
+        console.error("fallo avisando tras la llamada:", err.message);
+      }
     }
   });
 }
