@@ -1,0 +1,14 @@
+[Unit]
+Description=Atlas WhatsApp limb (secretary, isolated no-tools reply pipeline)
+After=network.target atlas.service
+
+[Service]
+Type=simple
+User=santo
+WorkingDirectory=/home/santo/assistent-atlas/assistent-whatsapp
+ExecStart=/home/santo/.nvm/versions/node/v20.20.2/bin/node --env-file=.env src/index.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

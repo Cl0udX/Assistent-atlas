@@ -1,0 +1,17 @@
+{
+  "name": "atlas-whatsapp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Atlas WhatsApp limb: recibe mensajes entrantes, los reenvia a Atlas (solo lectura, sin tools) y envia la respuesta generada.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^6.7.9",
+    "pino": "^9.4.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

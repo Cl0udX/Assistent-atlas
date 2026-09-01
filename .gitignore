@@ -1,0 +1,25 @@
+# Dependencias
+node_modules/
+__pycache__/
+*.pyc
+
+# Secretos / credenciales (tokens, API keys, secrets compartidos)
+.env
+.env.*
+!.env.example
+
+# Sesion de WhatsApp (Baileys): equivale a las credenciales del dispositivo
+# vinculado a la cuenta real. NUNCA debe subirse a git.
+**/session/
+
+# Bases de datos locales
+*.db
+*.sqlite
+*.sqlite3
+
+# Datos privados en runtime (numeros de telefono reales)
+blacklist.csv
+
+# Logs y basura de sistema operativo
+*.log
+.DS_Store
