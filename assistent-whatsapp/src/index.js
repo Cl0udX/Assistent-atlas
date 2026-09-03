@@ -1,4 +1,5 @@
 import fs from "fs";
+import http from "http";
 import { makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import pino from "pino";
@@ -267,6 +268,11 @@ function classifyMessage(message) {
   return null;
 }
 
+// Socket activo, para que el servidor HTTP de abajo (pedidos de ENVIO desde
+// Atlas, ej. "mandale un mensaje a X") pueda usarlo. Null mientras no haya
+// conexion viva.
+let currentSock = null;
+
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
 
@@ -293,6 +299,7 @@ async function start() {
       qrcode.generate(qr, { small: true });
     }
     if (connection === "close") {
+      currentSock = null;
       const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
       console.log("Conexion cerrada.", loggedOut ? "Sesion cerrada, hay que re-vincular." : "Reintentando en 3s...");
@@ -302,6 +309,7 @@ async function start() {
         }, 3000);
       }
     } else if (connection === "open") {
+      currentSock = sock;
       console.log("atlas-whatsapp conectado.");
     }
   });
@@ -487,6 +495,111 @@ async function start() {
     }
   });
 }
+
+// Servidor HTTP minimo (sin dependencias nuevas) para que Atlas pueda pedir
+// el ENVIO de un mensaje (ej. "mandale un mensaje a X"), la direccion
+// contraria al resto de este archivo. Solo escucha en localhost.
+const SEND_SERVER_PORT = Number(process.env.ATLAS_WHATSAPP_SEND_PORT || 8091);
+
+function startSendServer() {
+  const server = http.createServer((req, res) => {
+    if (req.headers["x-atlas-secret"] !== SHARED_SECRET) {
+      res.writeHead(403, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "forbidden" }));
+      return;
+    }
+
+    if (req.method === "GET" && req.url === "/groups") {
+      (async () => {
+        try {
+          if (!currentSock) {
+            res.writeHead(503, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "whatsapp no esta conectado ahora" }));
+            return;
+          }
+          const groups = await currentSock.groupFetchAllParticipating();
+          const list = Object.values(groups).map((g) => ({ jid: g.id, subject: g.subject }));
+          res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ groups: list }));
+        } catch (err) {
+          console.error("fallo listando grupos:", err.message);
+          res.writeHead(500, { "Content-Type": "application/json" }).end(JSON.stringify({ error: err.message }));
+        }
+      })();
+      return;
+    }
+
+    if (req.method === "GET" && req.url.startsWith("/resolve")) {
+      (async () => {
+        try {
+          if (!currentSock) {
+            res.writeHead(503, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "whatsapp no esta conectado ahora" }));
+            return;
+          }
+          const url = new URL(req.url, "http://localhost");
+          const number = digitsOnly(url.searchParams.get("number") || "");
+          if (!number) {
+            res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "falta number" }));
+            return;
+          }
+          const results = await currentSock.onWhatsApp(number);
+          const match = (results || [])[0];
+          res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
+            exists: !!match?.exists,
+            jid: match?.jid || `${number}@s.whatsapp.net`,
+            lid: match?.lid || null,
+          }));
+        } catch (err) {
+          console.error("fallo resolviendo numero:", err.message);
+          res.writeHead(500, { "Content-Type": "application/json" }).end(JSON.stringify({ error: err.message }));
+        }
+      })();
+      return;
+    }
+
+    if (req.method !== "POST" || req.url !== "/send") {
+      res.writeHead(404).end();
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", async () => {
+      try {
+        const { jid, text, audio_b64, image_b64, caption } = JSON.parse(body || "{}");
+        if (!jid) {
+          res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "falta jid" }));
+          return;
+        }
+        if (!currentSock) {
+          res.writeHead(503, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "whatsapp no esta conectado ahora" }));
+          return;
+        }
+        let sent;
+        if (audio_b64) {
+          sent = await currentSock.sendMessage(jid, {
+            audio: Buffer.from(audio_b64, "base64"),
+            mimetype: "audio/ogg; codecs=opus",
+            ptt: true,
+          });
+        } else if (image_b64) {
+          sent = await currentSock.sendMessage(jid, {
+            image: Buffer.from(image_b64, "base64"),
+            caption: caption || undefined,
+          });
+        } else {
+          sent = await currentSock.sendMessage(jid, { text: text || "" });
+        }
+        markOwnMessage(sent);
+        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ status: "sent" }));
+      } catch (err) {
+        console.error("fallo procesando pedido de envio:", err.message);
+        res.writeHead(500, { "Content-Type": "application/json" }).end(JSON.stringify({ error: err.message }));
+      }
+    });
+  });
+  server.listen(SEND_SERVER_PORT, "127.0.0.1", () => {
+    console.log(`Servidor de envio (pedidos de Atlas) escuchando en 127.0.0.1:${SEND_SERVER_PORT}`);
+  });
+}
+
+startSendServer();
 
 process.on("unhandledRejection", (err) => {
   console.error("unhandled rejection (ignorado, sigue corriendo):", err?.message || err);
